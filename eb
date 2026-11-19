@@ -1,0 +1,757 @@
+#!/usr/bin/env bash
+# EditorBookmarks application
+
+set -o pipefail
+shopt -u nocasematch
+umask 077
+
+version=0.1.4
+config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/editorbookmarks
+database=$config_dir/bookmarks_db.txt
+settings=$config_dir/config.conf
+
+die() {
+    if [[ ${terminal_fd-} ]]; then
+        prompt_gap
+    fi
+    printf 'eb: %s\n' "$*" >&2
+    exit 1
+}
+usage_error() { die "$* Run 'eb -h' for usage."; }
+
+brief_help() {
+    cat <<'HELP'
+EditorBookmarks - Open bookmarked files in your preferred editor.
+
+Usage: eb [options] [arguments]
+
+Options:
+  -a, --add [name path]        Add bookmark; prompt if omitted
+  -u, --update <name> [path]   Update path or description
+  -r, --remove <name>         Remove bookmark, with confirmation
+  -n, --rename <old> <new>    Rename bookmark
+  -l, --list                   List bookmarks
+  -s, --search <text>          Search names, paths and descriptions
+  -d, --description <text>   Description for add/update
+  -e, --editor <command>      One-off editor override
+      --sudo                 Run the editor with sudo for this invocation
+      --set-editor <command>  Save preferred editor
+      --no-color              Disable colours
+  -h                          Show brief help
+      --help                  Show detailed help
+  -v, --version               Show version
+
+Open a file: eb mango  or  eb ./notes.md
+Run 'eb --help' for detailed usage and examples.
+See README.md for full documentation.
+HELP
+}
+
+long_help() {
+    brief_help
+    cat <<'HELP'
+
+Usage forms
+  eb [--sudo] [-e <editor>] <bookmark-or-file>
+  eb -a
+  eb -a <name> <path> [-d <description>]
+  eb -u <name> [<path>] [-d <description>]
+  eb -r <name>
+  eb -n <old-name> <new-name>
+  eb -l
+  eb -s <text>
+  eb --set-editor <command>
+  eb -h | --help | -v | --version
+
+Opening
+  eb mango
+  eb ./notes.md
+  eb -e nano mango
+  eb hosts --sudo
+  An explicit path goes straight to the file. A bare name tries the bookmark
+  first, then a local file if there is no bookmark. An unavailable bookmark
+  stays saved and takes precedence over a same-named local file.
+  Use --sudo to run the editor as root for this invocation, just as with
+  sudo <editor> <file>. It works with the preferred editor or an -e override.
+
+Adding and updating
+  eb -a
+  eb -a mango ~/.config/mango/config.conf -d "Main MangoWM settings"
+  eb -u mango
+  eb -u mango ./new.conf -d "New settings"
+  eb -u mango -d ""
+  Bare add asks for name, path and optional description. An update with only
+  a name asks for a path and description, and Enter keeps each existing value.
+  Explicit updates change the supplied fields. Use -d "" to clear a description.
+  Ctrl+C cancels a prompt. Names start with a lowercase ASCII letter or digit
+  and may also contain hyphens and underscores. Names must be unique.
+  Use absolute paths, ~/ paths or relative paths. Quote paths with spaces on
+  the command line and enter them literally at prompts. Saved paths are
+  absolute and preserve symbolic links. New paths must point to regular files.
+  You can change the description or name while the saved path is unavailable.
+
+Renaming and removing
+  eb -n mango mangosettings
+  eb -r mangosettings
+  Removal asks for confirmation and removes only the bookmark.
+
+Listing and searching
+  eb -l
+  eb -s "Mango settings"
+  Search finds case-insensitive literal substrings in each stored field.
+  Leading, trailing and repeated spaces in a quoted search are significant.
+
+Editor selection
+  eb --set-editor micro
+  eb mango -e zeditor
+  Choose one executable name or path. Use a wrapper for extra arguments.
+  If no editor is selected, opening a file asks for one. Editors launch
+  normally and control their own foreground or background behaviour.
+
+Options can appear before or after positional arguments. Option values go
+immediately after their option and positional arguments retain their order.
+Use one operation and specify each option once. Help and version stand alone.
+Use --no-color or set NO_COLOR to suppress colour. Redirected output is plain.
+
+See README.md for installation, completion, wrappers, privileged editing,
+backup recovery and full documentation.
+HELP
+}
+
+if (( $# == 0 )); then
+    printf '%s\n' 'Usage: eb <bookmark-or-file> | eb [options]' "Run 'eb -h' for usage."
+    exit
+fi
+if (( $# == 1 )); then
+    case $1 in
+        -h) brief_help; exit ;;
+        --help) long_help; exit ;;
+        -v|--version) printf 'EditorBookmarks %s\n' "$version"; exit ;;
+    esac
+fi
+
+# The shells pass a zero-based cursor slot and the full argument vector.
+# The same parser handles complete tokens on either side of that slot.
+complete=0
+cursor=-1
+if [[ $1 == --_complete ]]; then
+    [[ $# -ge 3 && $2 =~ ^(0|[1-9][0-9]{0,7})$ ]] || exit 1
+    complete=1
+    cursor=$2
+    shift 2
+    (( cursor < $# )) || exit 1
+fi
+
+declare -A seen=()
+declare -a positional=()
+operation=open
+description=
+editor=
+query=
+cursor_kind=
+cursor_position=-1
+prefix=
+index=0
+while (( $# )); do
+    arg=$1
+    shift
+    if (( index == cursor )); then
+        cursor_kind=positional
+        cursor_position=${#positional[@]}
+        prefix=$arg
+        positional+=('')
+        (( index += 1 ))
+        continue
+    fi
+    (( index += 1 ))
+    value_required=0
+    main=0
+    case $arg in
+        -a|--add) key=add; main=1 ;;
+        -u|--update) key=update; main=1 ;;
+        -r|--remove) key=remove; main=1 ;;
+        -n|--rename) key=rename; main=1 ;;
+        -l|--list) key=list; main=1 ;;
+        -s|--search) key=search; main=1; value_required=1 ;;
+        --set-editor) key=set-editor; main=1; value_required=1 ;;
+        -d|--description) key=description; value_required=1 ;;
+        -e|--editor) key=editor; value_required=1 ;;
+        --sudo) key=sudo ;;
+        --no-color) key=no-color ;;
+        -h|--help|-v|--version) usage_error 'Help and version must be used alone.' ;;
+        -*) usage_error "Unknown option: $arg." ;;
+        *) positional+=("$arg"); continue ;;
+    esac
+    [[ ! ${seen[$key]+yes} ]] || usage_error "Repeated option: $arg."
+    seen[$key]=1
+    if (( main )); then
+        [[ $operation == open ]] || usage_error 'Use only one main operation.'
+        operation=$key
+    fi
+    if (( value_required )); then
+        (( $# )) || usage_error "$arg requires a value."
+        value=$1
+        shift
+        if (( index == cursor )); then
+            cursor_kind=value
+            cursor_position=-1
+        fi
+        (( index += 1 ))
+        case $key in
+            description) description=$value ;;
+            search) query=$value ;;
+            *) editor=$value ;;
+        esac
+    fi
+done
+
+has_description=${seen[description]+yes}
+has_override=${seen[editor]+yes}
+has_sudo=${seen[sudo]+yes}
+if [[ $has_description && $operation != add && $operation != update ]]; then
+    usage_error 'Use --description with add or update.'
+fi
+if [[ $has_override && $operation != open ]]; then
+    usage_error 'Use --editor when opening a file.'
+fi
+if [[ $has_sudo && $operation != open ]]; then
+    usage_error 'Use --sudo when opening a file.'
+fi
+
+valid_name() {
+    local LC_ALL=C
+    [[ $1 =~ ^[a-z0-9][a-z0-9_-]*$ ]]
+}
+
+valid_field() {
+    [[ $1 != *['|']* && $1 != *[$'\r\n']* ]]
+}
+
+declare -A paths=() descriptions=()
+load_database() {
+    local data='' line name path details rest fd number=0
+    paths=()
+    descriptions=()
+    if [[ ! -e $database && ! -L $database ]]; then
+        target_status "$database"
+        if [[ $status == 'NOT FOUND' ]]; then
+            return 0
+        fi
+        [[ $status != 'CANNOT CHECK' ]] || die "Cannot access database: $database"
+    fi
+    [[ -f $database ]] || die "Database is not a regular file: $database"
+    # Reading up to NUL checks for bytes that Bash line reads would discard.
+    exec {fd}< "$database" || die "Cannot read database: $database"
+    if IFS= read -r -d '' -u "$fd" data; then
+        rest=${data//[^$'\n']/}
+        die "Malformed database at line $((${#rest} + 1)): NUL byte."
+    fi
+    exec {fd}<&-
+    [[ $data ]] || return 0
+    while IFS= read -r line; do
+        (( number += 1 ))
+        [[ $line == *'|'*'|'* ]] ||
+            die "Malformed database at line $number: expected three fields."
+        name=${line%%|*}
+        rest=${line#*|}
+        path=${rest%%|*}
+        details=${rest#*|}
+        valid_name "$name" || die "Malformed database at line $number: invalid bookmark name."
+        if [[ $path != /* ]] || ! valid_field "$path"; then
+            die "Malformed database at line $number: expected an absolute path without line breaks."
+        fi
+        valid_field "$details" ||
+            die "Malformed database at line $number: expected three fields without line breaks."
+        [[ ! ${paths[$name]+yes} ]] ||
+            die "Malformed database at line $number: duplicate bookmark '$name'."
+        paths[$name]=$path
+        descriptions[$name]=$details
+    done <<< "${data%$'\n'}"
+    return 0
+}
+
+sorted_names() {
+    if (( ${#paths[@]} )); then
+        printf '%s\n' "${!paths[@]}" | LC_ALL=C sort
+    fi
+}
+
+complete_argument() {
+    [[ $cursor_kind == positional && $prefix != -* ]] || return 0
+    case $operation:$cursor_position in
+        open:0)
+            (( ${#positional[@]} == 1 )) || return 0
+            printf 'files\n'
+            [[ $prefix != */* ]] || return 0
+            ;;
+        add:1|update:1)
+            (( ${#positional[@]} == 2 )) && printf 'files\n'
+            return
+            ;;
+        remove:0) (( ${#positional[@]} == 1 )) || return 0 ;;
+        rename:0|update:0) (( ${#positional[@]} <= 2 )) || return 0 ;;
+        *) return 0 ;;
+    esac
+    # Only names are needed here. The normal commands validate all fields.
+    [[ -f $database ]] || return 0
+    EB_PREFIX="$prefix" LC_ALL=C awk -F '[|]' '
+        NF == 3 && $1 ~ /^[a-z0-9][a-z0-9_-]*$/ && index($1, ENVIRON["EB_PREFIX"]) == 1 {
+            print "name " $1
+        }
+    ' < "$database" | LC_ALL=C sort -u
+}
+
+if (( complete )); then
+    complete_argument
+    exit 0
+fi
+
+count=${#positional[@]}
+case $operation in
+    open) (( count == 1 )) || usage_error 'Supply one bookmark or file.' ;;
+    add)
+        (( count == 2 || (count == 0 && ! ${#has_description}) )) ||
+            usage_error 'Supply both a name and a path, or use bare add.'
+        ;;
+    update) (( count == 1 || count == 2 )) || usage_error 'Supply a bookmark name and an optional path.' ;;
+    remove) (( count == 1 )) || usage_error 'Supply one bookmark name.' ;;
+    rename) (( count == 2 )) || usage_error 'Supply the old and new bookmark names.' ;;
+    *)
+        (( count == 0 )) || usage_error 'Unexpected positional argument.'
+        [[ $operation != search || $query ]] || usage_error 'Search text cannot be empty.'
+        ;;
+esac
+if [[ $has_override || $operation == set-editor ]]; then
+    [[ $editor ]] || usage_error 'Supply an editor executable.'
+fi
+
+green='' red='' reset='' prompt_start='' prompt_end=''
+if [[ ! ${NO_COLOR+x} && ! ${seen[no-color]+yes} ]]; then
+    if [[ -t 1 ]]; then
+        green=$'\e[32m'
+        red=$'\e[31m'
+        reset=$'\e[0m'
+    fi
+    if [[ -t 2 ]]; then
+        prompt_start=$'\e[1m'
+        prompt_end=$'\e[0m'
+    fi
+fi
+
+prompt_gap() {
+    if [[ -t 2 ]]; then
+        printf '\n' >&2
+    fi
+}
+
+cancel() {
+    prompt_gap
+    printf '%s\n' 'Cancelled.' >&2
+    exit 1
+}
+
+prompt() {
+    local variable=$1 message=$2
+    # Ask the person controlling the terminal even if stdin is redirected.
+    if ! IFS= read -r -u "$terminal_fd" -p "$prompt_start$message$prompt_end" "${variable?}"; then
+        die 'Input could not be read. No changes were saved.'
+    fi
+}
+
+open_terminal() {
+    [[ ${terminal_fd-} ]] && return 0
+    { exec {terminal_fd}<> /dev/tty; } 2>/dev/null ||
+        die 'Interactive input requires a terminal. No changes were saved.'
+    trap 'cancel' INT
+}
+
+check_new_name() {
+    local LC_ALL=C
+    local candidate=$1 lower answer
+    lower=${candidate,,}
+    [[ $candidate ]] || die 'Bookmark name cannot be empty.'
+    [[ $lower != *[!a-z0-9_-]* ]] ||
+        die 'Bookmark names may contain only ASCII letters, digits, hyphens and underscores.'
+    valid_name "$lower" || die 'A bookmark name must start with a letter or digit.'
+    [[ ! ${paths[$lower]+yes} ]] || die "Bookmark '$lower' already exists."
+    if [[ $lower != "$candidate" ]]; then
+        open_terminal
+        prompt_gap
+        printf '%s\n' 'Bookmark names must use lowercase letters.' >&2
+        prompt answer "Use '$lower' instead? [Y/n]: "
+        case ${answer,,} in
+            ''|y|yes) ;;
+            *) cancel ;;
+        esac
+    fi
+    new_name=$lower
+}
+
+require_bookmark() {
+    valid_name "$1" || die "Invalid bookmark name: '$1'. Use lowercase letters or digits first, followed by lowercase letters, digits, hyphens or underscores."
+    if [[ ! ${paths[$1]+yes} ]]; then
+        if (( ${#paths[@]} == 0 )); then
+            printf "Bookmark '%s' was not found. No bookmarks have been saved yet.\nAdd one with: eb -a\n" "$1" >&2
+            exit 1
+        fi
+        die "Bookmark '$1' was not found."
+    fi
+}
+
+absolute_path() {
+    local input=$1 base
+    [[ $input ]] || die 'File path cannot be empty.'
+    case $input in
+        \~/*) absolute=$HOME/${input:2} ;;
+        /*) absolute=$input ;;
+        *)
+            # Keep all components of the input, including symlink/.. pairs.
+            # A sentinel preserves trailing newlines in the working directory.
+            base=$(pwd -P && printf '.') || die 'Cannot determine the working directory.'
+            base=${base%$'\n.'}
+            absolute=${base%/}/$input
+            ;;
+    esac
+}
+
+target_status() {
+    local error
+    status=
+    if [[ -f $1 ]]; then
+        return
+    elif [[ -e $1 ]]; then
+        status='NOT A FILE'
+    elif error=$(LC_ALL=C stat -L -- "$1" 2>&1); then
+        [[ -f $1 ]] || status='NOT A FILE'
+    else
+        case $error in
+            *': No such file or directory'|*': Not a directory') status='NOT FOUND' ;;
+            *) status='CANNOT CHECK' ;;
+        esac
+    fi
+}
+
+replacement_path() {
+    absolute_path "$1"
+    valid_field "$absolute" || die 'Saved paths cannot contain | or line breaks.'
+    target_status "$absolute"
+    [[ ! $status ]] || die "Path [$status]: $absolute"
+}
+
+show_entry() {
+    local name=$1 path=${paths[$1]} details=${descriptions[$1]} colour=$green
+    local width=${2:-${#name}}
+    target_status "$path"
+    [[ ! $status ]] || colour=$red
+    printf '%-*s   %s%s%s' "$width" "$name" "$colour" "$path" "$reset"
+    [[ ! $status ]] || printf ' [%s]' "$status"
+    printf '\n'
+    if [[ $details ]]; then
+        printf '%*s%s\n' "$((width + 3))" '' "$details"
+    fi
+}
+
+show_matches() {
+    local name path details needle=${query,,} width=0 index
+    local -a matches=()
+    if (( ${#paths[@]} == 0 )); then
+        printf '%s\n' 'No bookmarks have been saved yet.'
+        return
+    fi
+    while IFS= read -r name; do
+        path=${paths[$name]}
+        details=${descriptions[$name]}
+        if [[ $operation == list || ${name,,} == *"$needle"* ||
+              ${path,,} == *"$needle"* || ${details,,} == *"$needle"* ]]; then
+            matches+=("$name")
+            if (( ${#name} > width )); then
+                width=${#name}
+            fi
+        fi
+    done < <(sorted_names)
+    if (( ${#matches[@]} == 0 )); then
+        printf '%s\n' 'No matching bookmarks.'
+        return
+    fi
+    for index in "${!matches[@]}"; do
+        (( index )) && printf '\n'
+        show_entry "${matches[index]}" "$width"
+    done
+}
+
+lock_config() {
+    mkdir -p -- "$config_dir" || die "Cannot create configuration directory: $config_dir"
+    exec {lock_fd}>> "$config_dir/.lock" || die 'Cannot open the configuration lock.'
+    flock -x "$lock_fd" || die 'Cannot lock the configuration.'
+}
+
+cleanup() {
+    [[ ! ${new_file-} ]] || rm -f -- "$new_file"
+    [[ ! ${backup_file-} ]] || rm -f -- "$backup_file"
+    return 0
+}
+
+save_database() {
+    local name
+    trap cleanup EXIT
+    new_file=$(mktemp -- "$database.tmp.XXXXXXXX") || die 'Cannot prepare bookmark database.'
+    if ! {
+        for name in "${!paths[@]}"; do
+            printf '%s|%s|%s\n' "$name" "${paths[$name]}" "${descriptions[$name]}" || exit 1
+        done
+    } | LC_ALL=C sort -t '|' -k1,1 > "$new_file"; then
+        die 'Cannot write the replacement bookmark database.'
+    fi
+    if [[ -e $database ]]; then
+        backup_file=$(mktemp -- "$database.bak.tmp.XXXXXXXX") || die 'Cannot prepare database backup.'
+        cat -- "$database" > "$backup_file" || die 'Cannot copy database backup.'
+        mv -fT -- "$backup_file" "$database.bak" || die 'Cannot replace database backup.'
+        backup_file=
+    fi
+    mv -fT -- "$new_file" "$database" || die 'Cannot replace bookmark database.'
+    new_file=
+}
+
+# Prompts happen before taking the lock. Re-read under lock so other changes
+# survive, and abort if the particular entry being edited has changed.
+manage_bookmark() {
+    local name=${positional[0]-} path=${positional[1]-} details=$description
+    local old_path old_details answer result replace=0
+    valid_field "$details" || die 'Descriptions cannot contain | or line breaks.'
+    case $operation in
+        add)
+            if (( count == 0 )); then
+                open_terminal
+                prompt_gap
+                prompt name 'Bookmark name: '
+            fi
+            check_new_name "$name"
+            name=$new_name
+            if (( count == 0 )); then
+                prompt_gap
+                prompt path 'File path: '
+            fi
+            replacement_path "$path"
+            path=$absolute
+            replace=1
+            if (( count == 0 )); then
+                prompt_gap
+                prompt details 'Description (optional): '
+            fi
+            ;;
+        *)
+            require_bookmark "$name"
+            old_path=${paths[$name]}
+            old_details=${descriptions[$name]}
+            path=$old_path
+            details=$old_details
+            case $operation in
+                update)
+                    if (( count == 1 )) && [[ ! $has_description ]]; then
+                        open_terminal
+                        prompt_gap
+                        printf 'Current path: %s\n' "$old_path"
+                        prompt answer 'Replacement path (Enter to keep): '
+                        if [[ $answer ]]; then
+                            replacement_path "$answer"
+                            path=$absolute
+                            replace=1
+                        fi
+                        prompt_gap
+                        printf 'Current description: %s\n' "${old_details:-[none]}"
+                        prompt answer 'Replacement description (Enter to keep): '
+                        [[ ! $answer ]] || details=$answer
+                    else
+                        if (( count == 2 )); then
+                            replacement_path "${positional[1]}"
+                            path=$absolute
+                            replace=1
+                        fi
+                        [[ ! $has_description ]] || details=$description
+                    fi
+                    ;;
+                rename) check_new_name "${positional[1]}" ;;
+                remove)
+                    show_entry "$name"
+                    open_terminal
+                    prompt_gap
+                    prompt answer 'Remove this bookmark? [y/N]: '
+                    case ${answer,,} in
+                        y|yes) ;;
+                        *) cancel ;;
+                    esac
+                    ;;
+            esac
+            ;;
+    esac
+    valid_field "$details" || die 'Descriptions cannot contain | or line breaks.'
+    lock_config
+    load_database
+    if [[ $operation != add ]]; then
+        [[ ${paths[$name]-} == "$old_path" && ${descriptions[$name]-} == "$old_details" ]] ||
+            die "Bookmark '$name' changed during this operation. Try again."
+    fi
+    if (( replace )); then
+        target_status "$path"
+        [[ ! $status ]] || die "Path [$status]: $path"
+    fi
+    case $operation in
+        add) result="Added bookmark '$name'." ;;
+        update) result="Updated bookmark '$name'." ;;
+        rename)
+            unset 'paths[$name]' 'descriptions[$name]'
+            result="Renamed bookmark '$name' to '$new_name'."
+            name=$new_name
+            ;;
+        remove)
+            unset 'paths[$name]' 'descriptions[$name]'
+            result="Removed bookmark '$name'."
+            ;;
+    esac
+    case $operation in
+        add|rename)
+            [[ ! ${paths[$name]+yes} ]] || die "Bookmark '$name' already exists."
+            ;;
+    esac
+    if [[ $operation != remove ]]; then
+        paths[$name]=$path
+        descriptions[$name]=$details
+    fi
+    save_database
+    if [[ ${terminal_fd-} ]]; then
+        prompt_gap
+        printf '%s%s%s\n' "$green" "$result" "$reset"
+    else
+        printf '%s\n' "$result"
+    fi
+    if [[ $operation == update || $operation == rename ]]; then
+        target_status "$path"
+        [[ ! $status ]] || printf 'Warning: [%s] %s\n' "$status" "$path" >&2
+    fi
+}
+
+resolve_editor() {
+    local input=$1
+    local shell_syntax='|&;<>$`(){}*?[]'
+    selected=$input
+    executable=
+    [[ $input && $input != *[$'\r\n']* ]] || return 1
+    if [[ $input == */* ]]; then
+        absolute_path "$input"
+        selected=$absolute
+        executable=$absolute
+    else
+        # Bare names are literal PATH lookups, never aliases or functions.
+        [[ $input != -* && $input != *[[:space:]]* &&
+           $input != *["$shell_syntax"]* ]] || return 1
+        executable=$(type -P -- "$input") || return 1
+    fi
+    [[ -f $executable && -x $executable ]]
+}
+
+read_settings() {
+    local data=
+    saved_editor=
+    [[ -e $settings || -L $settings ]] || return 0
+    [[ -f $settings && -r $settings ]] || die "Cannot read settings: $settings"
+    if IFS= read -r -d '' data < "$settings"; then
+        die "Invalid editor settings: $settings"
+    fi
+    data=${data%$'\n'}
+    [[ $data == editor=?* && $data != *[$'\r\n']* ]] ||
+        die "Invalid editor settings: $settings"
+    saved_editor=${data#editor=}
+}
+
+save_editor() {
+    trap cleanup EXIT
+    new_file=$(mktemp -- "$settings.tmp.XXXXXXXX") || die 'Cannot prepare editor settings.'
+    printf 'editor=%s\n' "$selected" > "$new_file" || die 'Cannot write editor settings.'
+    mv -fT -- "$new_file" "$settings" || die 'Cannot replace editor settings.'
+    new_file=
+}
+
+choose_editor() {
+    local answer saved_editor
+    if [[ $has_override ]]; then
+        resolve_editor "$editor" || die "Editor is unavailable or is not a single executable: $editor"
+        return
+    fi
+    read_settings
+    if [[ $saved_editor ]]; then
+        resolve_editor "$saved_editor" || die "Saved editor is unavailable: $saved_editor"
+        return
+    fi
+    open_terminal
+    prompt_gap
+    printf '%s\n' 'No preferred editor has been set.' >&2
+    while true; do
+        prompt answer 'Enter the editor command, for example micro, nano, vim, kate or zed: '
+        [[ $answer ]] || cancel
+        if resolve_editor "$answer"; then
+            break
+        fi
+        prompt_gap
+        printf 'Editor is unavailable or is not a single executable: %s\n' "$answer" >&2
+    done
+    lock_config
+    read_settings
+    if [[ $saved_editor ]]; then
+        resolve_editor "$saved_editor" || die "Saved editor is unavailable: $saved_editor"
+    else
+        save_editor
+    fi
+    exec {lock_fd}>&-
+}
+
+open_file() {
+    local argument=${positional[0]} path bookmark=
+    local sudo_path
+    if [[ $argument != */* ]] && valid_name "$argument" &&
+        [[ ${paths[$argument]+yes} ]]; then
+        bookmark=$argument
+        path=${paths[$argument]}
+    else
+        absolute_path "$argument"
+        path=$absolute
+    fi
+    target_status "$path"
+    if [[ $status ]]; then
+        if [[ $bookmark ]]; then
+            die "Bookmark '$bookmark' [$status]: $path"
+        elif [[ $status == 'NOT FOUND' ]] && valid_name "$argument"; then
+            require_bookmark "$argument"
+        else
+            die "Path [$status]: $path"
+        fi
+    fi
+    if [[ $has_sudo ]]; then
+        sudo_path=$(type -P -- sudo) ||
+            die 'Cannot find sudo. Install it to use --sudo.'
+    fi
+    choose_editor
+    target_status "$path"
+    [[ ! $status ]] || die "Path [$status]: $path"
+    if [[ ${terminal_fd-} ]]; then
+        exec {terminal_fd}>&-
+    fi
+    if [[ $has_sudo ]]; then
+        absolute_path "$executable"
+        exec -- "$sudo_path" -- "$absolute" "$path"
+    fi
+    # An absolute filename cannot start with a dash or resemble an option.
+    exec -- "$executable" "$path"
+}
+
+load_database
+case $operation in
+    open) open_file ;;
+    list|search) show_matches ;;
+    add|update|rename|remove) manage_bookmark ;;
+    set-editor)
+        resolve_editor "$editor" || die "Editor is unavailable or is not a single executable: $editor"
+        lock_config
+        save_editor
+        printf 'Preferred editor set to %s.\n' "$selected"
+        ;;
+esac

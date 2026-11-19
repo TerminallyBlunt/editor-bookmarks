@@ -1,0 +1,22 @@
+#compdef eb
+# EditorBookmarks Zsh completion
+
+local helper=${XDG_DATA_HOME:-"$HOME/.local/share"}/editorbookmarks/eb
+local reply
+local -a args names
+local -i files=0
+[[ -x $helper ]] || helper=${commands[eb]}
+[[ -n $helper ]] || return 0
+
+# Zsh retains the cursor word plus any following arguments in $words.
+args=("${words[@]}")
+args[CURRENT]=${(Q)PREFIX}
+args=("${(@Q)args}")
+for reply in "${(@f)$("$helper" --_complete "$((CURRENT - 2))" "${args[@]:1}" 2>/dev/null)}"; do
+    case $reply in
+        files) files=1 ;;
+        'name '*) names+=("${reply#name }") ;;
+    esac
+done
+(( ${#names} )) && _wanted bookmarks expl 'bookmark' compadd -Q -a names
+(( files )) && _files
